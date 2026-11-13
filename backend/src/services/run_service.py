@@ -1,13 +1,18 @@
 import csv,io
 from fastapi import HTTPException
-from redis import Redis
-from ..config.settings import REDIS_URL
 from ..models import SimulationRun,ServiceScenario,ArrivalProfile,QueueStudy,CapacityNote
 from ..utils.serialize import record
 from .erlang_algorithm import erlang_c
 from .audit_service import log
-queue=Redis.from_url(REDIS_URL,decode_responses=True)
-def list_runs(db):return [record(r) for r in db.query(SimulationRun).order_by(SimulationRun.id.desc())]
+from .recovery_service import dispatch_run
+
+PUBLIC_RUN_FIELDS=("id","name","scenario_id","customers","warmup","replications","seed","confidence","input_snapshot","status","result","error","owner","created_at","lease_owner","attempts","recoveries")
+
+def public_run(row):
+    # 不外泄 lease_token：它只在数据库内用于校验处理资格
+    return {k:getattr(row,k) for k in PUBLIC_RUN_FIELDS}
+
+def list_runs(db):return [public_run(r) for r in db.query(SimulationRun).order_by(SimulationRun.id.desc())]
 def get_run(db,rid):
     row=db.get(SimulationRun,rid)
     if not row:raise HTTPException(404,"运行不存在")
@@ -25,10 +30,9 @@ def create_run(db,data,user):
     if data.customers-data.warmup<100 or data.customers*data.replications>250000:raise HTTPException(422,"至少保留100顾客，且单任务总顾客不超过250000")
     row=SimulationRun(**data.model_dump(),input_snapshot=snapshot,owner=user.name)
     db.add(row);db.flush();log(db,user.email,"simulation.enqueue",row.id);db.commit()
-    try:queue.rpush("queue:jobs",row.id)
-    except Exception:
-        row.status="failed";row.error="队列不可用，请重新提交";db.commit();raise HTTPException(503,row.error)
-    return record(row)
+    # 派发丢失不判失败：试验保持可领取状态，恢复扫描会补发，worker 也会按冻结参数重算
+    dispatch_run(db,row.id)
+    return public_run(row)
 def export_run(db,rid):
     row=get_run(db,rid)
     if row.status!="completed" or not db.query(CapacityNote).filter_by(run_id=rid,status="approved").first():raise HTTPException(403,"仅获批的完成运行可导出")
